@@ -21601,7 +21601,11 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
     VkAccelerationStructureBuildGeometryInfoKHR *build_info;
     VkAccelerationStructureBuildRangeInfoKHR *range_infos;
     VkAccelerationStructureGeometryKHR *geometry_infos;
+    uint32_t primitive_counts_stack[VKD3D_BUILD_INFO_STACK_COUNT];
     uint32_t *primitive_counts = NULL;
+    bool primitive_counts_allocated = false;
+    VkDeviceSize current_size = 0;
+    bool have_current_size = false;
     enum vkd3d_rtas_kind rtas_kind;
     uint32_t geometry_count;
     size_t old_build_count = list->rtas_batch.build_info_count;
@@ -21626,17 +21630,25 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
 
     geometry_count = vkd3d_acceleration_structure_get_geometry_count(&desc->Inputs);
 
-#ifdef VKD3D_ENABLE_BREADCRUMBS
-    if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS) && geometry_count)
+    /* The converted primitive counts are needed to ask for the build's storage
+     * requirement, which is recorded below as the structure's D3D12
+     * CURRENT_SIZE answer, so they are produced unconditionally rather than
+     * only for breadcrumbs. */
+    if (geometry_count)
     {
-        primitive_counts = vkd3d_calloc(geometry_count, sizeof(*primitive_counts));
-        if (!primitive_counts)
+        if (geometry_count > VKD3D_BUILD_INFO_STACK_COUNT)
         {
-            d3d12_command_list_record_error(list, E_OUTOFMEMORY);
-            goto fail;
+            primitive_counts = vkd3d_calloc(geometry_count, sizeof(*primitive_counts));
+            primitive_counts_allocated = true;
+            if (!primitive_counts)
+            {
+                d3d12_command_list_record_error(list, E_OUTOFMEMORY);
+                goto fail;
+            }
         }
+        else
+            primitive_counts = primitive_counts_stack;
     }
-#endif
 
     if (!d3d12_command_list_allocate_rtas_build_info(list, geometry_count,
             &build_info, &geometry_infos, &omm_triangles_infos, &range_infos))
@@ -21650,6 +21662,31 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
     {
         ERR("Failed to convert inputs.\n");
         goto fail;
+    }
+
+    /* D3D12 defines an uncompacted structure's CURRENT_SIZE as exactly the
+     * ResultDataMaxSizeInBytes the application was given by
+     * GetRaytracingAccelerationStructurePrebuildInfo. The host's
+     * ACCELERATION_STRUCTURE_SIZE query answers a different quantity (the packed
+     * size plus serialization padding), so capture the D3D12 number here and
+     * record it on the placed structure below, for the postbuild query to
+     * replay. It is captured before the OMM VAs are resolved because the
+     * prebuild path that defines the application-visible number does not resolve
+     * them, and it goes through the same helper as prebuild so the two cannot
+     * disagree. */
+    if (primitive_counts)
+    {
+        const VkAccelerationStructureGeometryKHR *saved_pGeometries = build_info->pGeometries;
+        VkAccelerationStructureBuildSizesInfoKHR current_size_info;
+
+        /* pGeometries is assigned to the batch slot at flush time. */
+        build_info->pGeometries = geometry_infos;
+        vkd3d_acceleration_structure_get_build_sizes(list->device, build_info,
+                primitive_counts, &current_size_info);
+        build_info->pGeometries = saved_pGeometries;
+
+        current_size = current_size_info.accelerationStructureSize;
+        have_current_size = true;
     }
 
     if (!vkd3d_acceleration_structure_resolve_omm_va_maps(list->device, &desc->Inputs,
@@ -21685,6 +21722,12 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
     }
 
     build_info->scratchData.deviceAddress = desc->ScratchAccelerationStructureData;
+
+    if (have_current_size && desc->DestAccelerationStructureData)
+    {
+        vkd3d_va_map_set_rtas_build_size(&list->device->memory_allocator.va_map, list->device,
+                desc->DestAccelerationStructureData, current_size);
+    }
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     /* Immediately record the RTAS build command here so that we don't have
@@ -21761,10 +21804,13 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
             }
         }
 
-        vkd3d_free(primitive_counts);
-        primitive_counts = NULL;
+        /* primitive_counts is owned by the caller: it may be the stack array. */
     }
 #endif
+
+    if (primitive_counts_allocated)
+        vkd3d_free(primitive_counts);
+    primitive_counts = NULL;
 
     if (num_postbuild_info_descs)
     {
@@ -21788,7 +21834,8 @@ fail:
      * this batch. Previously these failures left null AS handles in it. */
     list->rtas_batch.build_info_count = old_build_count;
     list->rtas_batch.geometry_info_count = old_geometry_count;
-    vkd3d_free(primitive_counts);
+    if (primitive_counts_allocated)
+        vkd3d_free(primitive_counts);
     d3d12_command_list_mark_as_invalid(list, "Acceleration structure build recording failed.\n");
 }
 
@@ -21958,6 +22005,27 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyRaytracingAccelerationStruc
     {
         if (!vkd3d_acceleration_structure_copy(list, dst_data, src_as, mode, rtas_kind))
             d3d12_command_list_mark_as_invalid(list, "AS copy/serialization failed.\n");
+        else if (mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT)
+        {
+            /* A compacted structure's D3D12 CURRENT_SIZE is the COMPACTED_SIZE
+             * postbuild value, not the host's ACCELERATION_STRUCTURE_SIZE query. */
+            vkd3d_va_map_set_rtas_compacted(&list->device->memory_allocator.va_map, list->device, dst_data);
+        }
+        else if (mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE)
+        {
+            /* A clone keeps the source's form, so it keeps the source's
+             * CURRENT_SIZE answer. An unrecorded source stays unrecorded. */
+            VkDeviceSize src_build_size = 0;
+            bool src_compacted = false;
+
+            vkd3d_va_map_try_read_rtas_size(&list->device->memory_allocator.va_map, list->device, src_data,
+                    &src_build_size, &src_compacted);
+            if (src_compacted)
+                vkd3d_va_map_set_rtas_compacted(&list->device->memory_allocator.va_map, list->device, dst_data);
+            else if (src_build_size)
+                vkd3d_va_map_set_rtas_build_size(&list->device->memory_allocator.va_map, list->device,
+                        dst_data, src_build_size);
+        }
         VKD3D_BREADCRUMB_AUX64(dst_data);
         VKD3D_BREADCRUMB_AUX64(src_data);
         VKD3D_BREADCRUMB_AUX32(mode);

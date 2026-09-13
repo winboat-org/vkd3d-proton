@@ -159,6 +159,28 @@ static void vkd3d_acceleration_structure_convert_triangles(const struct d3d12_de
     RT_TRACE("  Vertex stride: %"PRIu64" bytes\n", desc->VertexBuffer.StrideInBytes);
 }
 
+void vkd3d_acceleration_structure_get_build_sizes(
+        struct d3d12_device *device,
+        VkAccelerationStructureBuildGeometryInfoKHR *build_info,
+        const uint32_t *primitive_counts,
+        VkAccelerationStructureBuildSizesInfoKHR *size_info)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+
+    if (build_info->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
+            VKD3D_CONFIG_FLAG_IS_SET(RTAS_ALLOW_BLAS_REBUILD_SIZES))
+    {
+        build_info->flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+    }
+
+    memset(size_info, 0, sizeof(*size_info));
+    size_info->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+
+    VK_CALL(vkGetAccelerationStructureBuildSizesKHR(device->vk_device,
+            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, build_info,
+            primitive_counts, size_info));
+}
+
 bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
         VkAccelerationStructureBuildGeometryInfoKHR *build_info,
@@ -451,13 +473,48 @@ void vkd3d_acceleration_structure_write_postbuild_info(
     }
     else if (desc->InfoType == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE)
     {
+        VkDeviceSize rtas_build_size = 0;
+        bool rtas_compacted = false;
+
         if (!list->device->device_info.ray_tracing_maintenance1_features.rayTracingMaintenance1)
         {
             vkd3d_acceleration_structure_recording_error(list, E_INVALIDARG, "CURRENT_SIZE requires rayTracingMaintenance1");
             return;
         }
-        vk_query_type = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR;
-        type_index = VKD3D_QUERY_TYPE_INDEX_RT_CURRENT_SIZE;
+
+        vkd3d_va_map_try_read_rtas_size(&list->device->memory_allocator.va_map, list->device, va,
+                &rtas_build_size, &rtas_compacted);
+
+        if (rtas_compacted)
+        {
+            /* D3D12 defines a compacted structure's current size as the COMPACTED_SIZE
+             * postbuild value, which is exactly the Vulkan compacted-size query. The
+             * host's ACCELERATION_STRUCTURE_SIZE query answers its packed size plus
+             * serialization padding, which for a compacted structure exceeds even the
+             * allocation the application sized from the compacted query. */
+            vk_query_type = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
+            type_index = VKD3D_QUERY_TYPE_INDEX_RT_COMPACTED_SIZE;
+        }
+        else if (rtas_build_size)
+        {
+            /* An uncompacted structure's current size is, by definition, the
+             * ResultDataMaxSizeInBytes the application was given by prebuild. The
+             * host cannot reproduce that number after the build, so replay the value
+             * recorded when the build was recorded. DXR wants this written with
+             * UNORDERED_ACCESS; the surrounding barriers already provide the
+             * TRANSFER_WRITE this uses. */
+            uint64_t size = rtas_build_size;
+
+            VK_CALL(vkCmdUpdateBuffer(list->cmd.vk_command_buffer, vk_buffer, offset, sizeof(size), &size));
+            return;
+        }
+        else
+        {
+            /* Nothing was recorded for this address (deserialized, unknown or an
+             * older record path): keep the previous host-query behaviour. */
+            vk_query_type = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR;
+            type_index = VKD3D_QUERY_TYPE_INDEX_RT_CURRENT_SIZE;
+        }
     }
     else if (desc->InfoType == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION)
     {

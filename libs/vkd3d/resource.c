@@ -5456,6 +5456,10 @@ bool vkd3d_create_acceleration_structure_view(struct d3d12_device *device, const
     object->info.buffer.offset = desc->offset;
     object->info.buffer.size = desc->size;
     object->info.buffer.rtas_kind = rtas_kind; /* Pre-publish, no atomic store required */
+    /* vkd3d_view_create does not zero the view, and only the build and copy
+     * paths record a CURRENT_SIZE answer, so start from the explicit "unknown". */
+    object->info.buffer.rtas_build_size = 0;
+    object->info.buffer.rtas_compacted = 0;
     *view = object;
     return true;
 }

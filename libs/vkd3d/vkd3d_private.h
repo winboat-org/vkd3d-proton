@@ -418,6 +418,19 @@ VkAccelerationStructureKHR vkd3d_va_map_place_acceleration_structure(struct vkd3
         struct d3d12_device *device,
         VkDeviceAddress va,
         enum vkd3d_rtas_kind rtas_kind);
+/* Records the D3D12 CURRENT_SIZE answer for the structure at va. A build records
+ * the ResultDataMaxSizeInBytes the application was given by prebuild; a COMPACT
+ * copy records "compacted", which makes CURRENT_SIZE answer with the host's
+ * COMPACTED_SIZE query instead. Entering either state clears the other. */
+void vkd3d_va_map_set_rtas_build_size(struct vkd3d_va_map *va_map,
+        struct d3d12_device *device, VkDeviceAddress va, VkDeviceSize build_size);
+void vkd3d_va_map_set_rtas_compacted(struct vkd3d_va_map *va_map,
+        struct d3d12_device *device, VkDeviceAddress va);
+/* Reads back what vkd3d_va_map_set_rtas_* recorded. Both outputs are zero when
+ * nothing has been recorded for va, which callers must treat as "unknown". */
+void vkd3d_va_map_try_read_rtas_size(struct vkd3d_va_map *va_map,
+        struct d3d12_device *device, VkDeviceAddress va,
+        VkDeviceSize *rtas_build_size, bool *rtas_compacted);
 void vkd3d_va_map_init(struct vkd3d_va_map *va_map);
 void vkd3d_va_map_cleanup(struct vkd3d_va_map *va_map);
 void vkd3d_va_map_insert_descriptor_heap(struct vkd3d_va_map *va_map,
@@ -1436,6 +1449,19 @@ struct vkd3d_view
             VkDeviceSize offset;
             VkDeviceSize size;
             uint32_t rtas_kind; /* not hashed; accessed atomically; stores vkd3d_rtas_kind */
+            /* D3D12's CURRENT_SIZE postbuild info is not the Vulkan
+             * ACCELERATION_STRUCTURE_SIZE query. For a structure that has not been
+             * compacted D3D12 defines it as exactly the ResultDataMaxSizeInBytes the
+             * application was given by prebuild, a number the host cannot reproduce
+             * after the build: RADV's size query answers the packed size plus its
+             * serialization padding, which exceeds the prebuild size for small
+             * structures and exceeds the structure's own allocation for compacted and
+             * cloned ones. Record what the application was told when the build or copy
+             * is recorded and replay it. build_size == 0 with compacted == 0 means
+             * "unknown", which preserves the pre-existing host-query fallback.
+             * Not hashed; accessed atomically. */
+            VkDeviceSize rtas_build_size;
+            uint32_t rtas_compacted;
         } buffer;
         struct
         {
@@ -7178,6 +7204,17 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
 bool vkd3d_acceleration_structure_resolve_omm_va_maps(struct d3d12_device *device,
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
         VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos);
+/* The single definition of a D3D12 build's storage requirement. Both
+ * GetRaytracingAccelerationStructurePrebuildInfo (which reports it to the
+ * application as ResultDataMaxSizeInBytes) and the recorded CURRENT_SIZE for a
+ * built structure go through this, so the two can never disagree. It applies the
+ * RTAS_ALLOW_BLAS_REBUILD_SIZES flag adjustment itself; the caller supplies the
+ * converted build info with pGeometries set. */
+void vkd3d_acceleration_structure_get_build_sizes(
+        struct d3d12_device *device,
+        VkAccelerationStructureBuildGeometryInfoKHR *build_info,
+        const uint32_t *primitive_counts,
+        VkAccelerationStructureBuildSizesInfoKHR *size_info);
 void vkd3d_acceleration_structure_write_postbuild_info(
         struct d3d12_command_list *list,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,

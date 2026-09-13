@@ -247,26 +247,22 @@ const struct vkd3d_unique_resource *vkd3d_va_map_deref(struct vkd3d_va_map *va_m
     return vkd3d_va_map_deref_mutable(va_map, va);
 }
 
-void vkd3d_va_map_try_read_rtas(struct vkd3d_va_map *va_map,
-        struct d3d12_device *device, VkDeviceAddress va,
-        VkAccelerationStructureKHR *acceleration_structure,
-        enum vkd3d_rtas_kind *rtas_kind)
+/* Resolves the acceleration structure view for an AS placed at va, or NULL when
+ * no resource covers va or no view has been created there yet. */
+static struct vkd3d_view *va_map_get_rtas_view(struct vkd3d_va_map *va_map,
+        struct d3d12_device *device, VkDeviceAddress va)
 {
     const struct vkd3d_unique_resource *resource;
     struct vkd3d_view_map *view_map;
-    const struct vkd3d_view *view;
     struct vkd3d_view_key key;
-
-    *acceleration_structure = VK_NULL_HANDLE;
-    *rtas_kind = VKD3D_RTAS_KIND_UNKNOWN;
 
     resource = vkd3d_va_map_deref(va_map, va);
     if (!resource || !resource->va || va < resource->va || va - resource->va >= resource->size)
-        return;
+        return NULL;
 
     view_map = vkd3d_atomic_ptr_load_explicit(&resource->view_map, vkd3d_memory_order_acquire);
     if (!view_map)
-        return;
+        return NULL;
 
     key.view_type = VKD3D_VIEW_TYPE_ACCELERATION_STRUCTURE;
     key.u.buffer.buffer = resource->vk_buffer;
@@ -275,13 +271,84 @@ void vkd3d_va_map_try_read_rtas(struct vkd3d_va_map *va_map,
     key.u.buffer.format = NULL;
     key.u.buffer.usage = 0;
 
-    view = vkd3d_view_map_get_view(view_map, device, &key);
+    return vkd3d_view_map_get_view(view_map, device, &key);
+}
+
+void vkd3d_va_map_try_read_rtas(struct vkd3d_va_map *va_map,
+        struct d3d12_device *device, VkDeviceAddress va,
+        VkAccelerationStructureKHR *acceleration_structure,
+        enum vkd3d_rtas_kind *rtas_kind)
+{
+    struct vkd3d_view *view;
+
+    *acceleration_structure = VK_NULL_HANDLE;
+    *rtas_kind = VKD3D_RTAS_KIND_UNKNOWN;
+
+    view = va_map_get_rtas_view(va_map, device, va);
     if (!view)
         return;
 
     *acceleration_structure = view->vk_acceleration_structure;
     *rtas_kind = (enum vkd3d_rtas_kind)
         vkd3d_atomic_uint32_load_explicit(&view->info.buffer.rtas_kind, vkd3d_memory_order_relaxed);
+}
+
+void vkd3d_va_map_try_read_rtas_size(struct vkd3d_va_map *va_map,
+        struct d3d12_device *device, VkDeviceAddress va,
+        VkDeviceSize *rtas_build_size, bool *rtas_compacted)
+{
+    struct vkd3d_view *view;
+
+    *rtas_build_size = 0;
+    *rtas_compacted = false;
+
+    view = va_map_get_rtas_view(va_map, device, va);
+    if (!view)
+        return;
+
+    *rtas_build_size = (VkDeviceSize)
+        vkd3d_atomic_uint64_load_explicit(&view->info.buffer.rtas_build_size, vkd3d_memory_order_acquire);
+    *rtas_compacted =
+        vkd3d_atomic_uint32_load_explicit(&view->info.buffer.rtas_compacted, vkd3d_memory_order_acquire) != 0;
+}
+
+/* A structure's view is created when its build or copy is recorded, so the
+ * record is always written on an already-placed structure. The two fields are
+ * a best-effort snapshot of the last build/copy recorded for this address,
+ * exactly like the rtas_kind state machine above: D3D12 requires the
+ * application to synchronize a postbuild query against the build it describes. */
+static void va_map_record_rtas_size(struct vkd3d_va_map *va_map, struct d3d12_device *device,
+        VkDeviceAddress va, VkDeviceSize build_size, uint32_t compacted)
+{
+    struct vkd3d_view *view = va_map_get_rtas_view(va_map, device, va);
+
+    if (!view)
+    {
+        WARN("No acceleration structure view at #%"PRIx64" for a CURRENT_SIZE record.\n", va);
+        return;
+    }
+
+    vkd3d_atomic_uint32_store_explicit(&view->info.buffer.rtas_compacted, compacted,
+            vkd3d_memory_order_release);
+    vkd3d_atomic_uint64_store_explicit(&view->info.buffer.rtas_build_size, (uint64_t)build_size,
+            vkd3d_memory_order_release);
+}
+
+void vkd3d_va_map_set_rtas_build_size(struct vkd3d_va_map *va_map,
+        struct d3d12_device *device, VkDeviceAddress va, VkDeviceSize build_size)
+{
+    /* 0 is the "not recorded" value, so a build that produced no usable size
+     * leaves the address on the host-query fallback rather than recording a lie. */
+    if (!build_size)
+        return;
+
+    va_map_record_rtas_size(va_map, device, va, build_size, 0);
+}
+
+void vkd3d_va_map_set_rtas_compacted(struct vkd3d_va_map *va_map,
+        struct d3d12_device *device, VkDeviceAddress va)
+{
+    va_map_record_rtas_size(va_map, device, va, 0, 1);
 }
 
 const char *vkd3d_get_rtas_kind_string(enum vkd3d_rtas_kind rtas_kind)

@@ -8909,7 +8909,6 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
     VkAccelerationStructureTrianglesOpacityMicromapKHR omm_triangles_infos_stack[VKD3D_BUILD_INFO_STACK_COUNT];
     VkAccelerationStructureGeometryKHR geometries_stack[VKD3D_BUILD_INFO_STACK_COUNT];
     VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos;
-    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     uint32_t primitive_counts_stack[VKD3D_BUILD_INFO_STACK_COUNT];
     VkAccelerationStructureBuildGeometryInfoKHR build_info;
     VkAccelerationStructureBuildSizesInfoKHR size_info;
@@ -8974,20 +8973,12 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
         goto cleanup;
     }
 
-    if (build_info.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
-        VKD3D_CONFIG_FLAG_IS_SET(RTAS_ALLOW_BLAS_REBUILD_SIZES))
-    {
-        build_info.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
-    }
-
     build_info.pGeometries = geometries;
 
-    memset(&size_info, 0, sizeof(size_info));
-    size_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-
-    VK_CALL(vkGetAccelerationStructureBuildSizesKHR(device->vk_device,
-            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info,
-            primitive_counts, &size_info));
+    /* The single definition of a build's storage requirement. The build path
+     * records the same number as the structure's CURRENT_SIZE answer, so a
+     * prebuild and its postbuild query cannot disagree. */
+    vkd3d_acceleration_structure_get_build_sizes(device, &build_info, primitive_counts, &size_info);
 
     /* An assumption is made here where RTAS_ALLOW_REBUILD_SIZES config will not make the required RTAS size smaller. */
     info->ResultDataMaxSizeInBytes = size_info.accelerationStructureSize;
