@@ -1158,6 +1158,14 @@ enum vkd3d_resource_flag
  * is a pure function of the create parameters, so the same code worked there. */
 #define VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT ((D3D12_HEAP_FLAGS)(1u << 30))
 
+/* Helios: DDI0102's mandatory no-output sample-count floor above FL11_0 --
+ * 1x | 4x | 8x | 16x. This is the D3D12 no-output *contract* (sample-frequency
+ * pixel shading with zero render targets and no depth/stencil), not host MSAA
+ * support, so a host whose Vulkan mask stops at 8x still declares the floor and
+ * backs the difference by clamping the Vulkan rasterization sample count. See
+ * docs/dx12/NO_OUTPUT_SAMPLES.md. */
+#define VKD3D_HELIOS_NO_OUTPUT_SAMPLE_COUNT_FLOOR 0x1du
+
 #define VKD3D_INVALID_TILE_INDEX (~0u)
 
 struct d3d12_sparse_image_region
@@ -6031,6 +6039,10 @@ struct d3d12_device
 #endif
     uint64_t shader_interface_key;
     uint32_t device_has_dgc_templates;
+    /* Helios: no-output pipelines that requested a sample count the host does
+     * not back and were rasterized at a lower effective count. Accessed
+     * atomically; reported at device destruction. docs/dx12/NO_OUTPUT_SAMPLES.md. */
+    uint32_t helios_no_output_sample_count_clamped;
 
     struct vkd3d_device_swapchain_info swapchain_info;
     struct vkd3d_device_frame_markers frame_markers;

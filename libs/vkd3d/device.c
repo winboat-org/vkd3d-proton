@@ -4846,6 +4846,10 @@ static void d3d12_device_destroy(struct d3d12_device *device)
 
     d3d_destruction_notifier_free(&device->destruction_notifier);
 
+    if (device->helios_no_output_sample_count_clamped)
+        INFO("Helios no-output sample count clamped %u time(s) to host-backed counts.\n",
+                device->helios_no_output_sample_count_clamped);
+
     if (device->internal_sparse_queue)
         d3d12_device_unmap_vkd3d_queue(device->internal_sparse_queue, NULL);
 
@@ -10627,9 +10631,19 @@ static void d3d12_device_caps_init_feature_options19(struct d3d12_device *device
      * and computing renderArea to be the intersection of all bound views. */
     options19->MismatchingOutputDimensionsSupported = TRUE;
     /* With no attachments, command-list state retains the PSO sample count.
-     * Vulkan and this D3D12 mask both encode counts as power-of-two bits. */
+     * Vulkan and this D3D12 mask both encode counts as power-of-two bits.
+     *
+     * ⚠ This is the D3D12 no-output *contract*, not the host MSAA mask. DDI0102
+     * above FL11_0 requires at least 1/4/8/16, and the retail runtime rejects a
+     * driver that reports less. AMD hosts cap Vulkan MSAA at 8x, so the host
+     * mask alone can never satisfy it. Helios declares the floor and backs the
+     * difference by clamping the Vulkan rasterization sample count in state.c
+     * (vkd3d_helios_effective_no_output_sample_count); see
+     * docs/dx12/NO_OUTPUT_SAMPLES.md. Do NOT collapse this back to the raw host
+     * mask -- that silently drops native FL12 admission on every AMD host. */
     options19->SupportedSampleCountsWithNoOutputs =
-            device->device_info.properties2.properties.limits.framebufferNoAttachmentsSampleCounts & 0x1f;
+            (device->device_info.properties2.properties.limits.framebufferNoAttachmentsSampleCounts & 0x1f) |
+            VKD3D_HELIOS_NO_OUTPUT_SAMPLE_COUNT_FLOOR;
     /* D3D12 expectations w.r.t. rounding match Vulkan spec.
      * However, both AMD and Intel native drivers round to even. RADV has no-trunc-coord workarounds.
      * Turnip enables round-to-even behavior for vkd3d. Same for ANV. */
@@ -11507,16 +11521,20 @@ HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t
     if (minimum_feature_level >= D3D_FEATURE_LEVEL_12_0 &&
             (caps->options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3 ||
              caps->options.ConservativeRasterizationTier < D3D12_CONSERVATIVE_RASTERIZATION_TIER_3 ||
-             (caps->options19.SupportedSampleCountsWithNoOutputs & 0x1f) != 0x1f ||
              !device->device_info.maintenance_8_features.maintenance8 || !device->vk_info.EXT_depth_range_unrestricted ||
              !device->device_info.vulkan_1_2_features.storageBuffer8BitAccess || !device->device_info.vulkan_1_2_features.shaderInt8 ||
              !device->device_info.features2.features.shaderStorageImageMultisample ||
              !device->device_info.features2.features.shaderStorageImageWriteWithoutFormat))
     {
-        ERR("Native FL12_1 backing unavailable: binding %u conservative %u no_output_samples %#x maintenance8 %u depth_range %u "
+        /* The no-output sample-count mask is deliberately absent from this
+         * predicate: it is a driver-declared contract backed by an
+         * effective-sample-count clamp, not evidence of host MSAA support.
+         * Requiring the host mask to contain 16x denied native FL12 on every
+         * AMD/RADV host while admitting it on NVIDIA. See
+         * docs/dx12/NO_OUTPUT_SAMPLES.md. */
+        ERR("Native FL12 backing unavailable: binding %u conservative %u maintenance8 %u depth_range %u "
                 "storage8 %u int8 %u image_msaa %u image_write_without_format %u.\n",
                 caps->options.ResourceBindingTier, caps->options.ConservativeRasterizationTier,
-                caps->options19.SupportedSampleCountsWithNoOutputs,
                 device->device_info.maintenance_8_features.maintenance8, device->vk_info.EXT_depth_range_unrestricted,
                 device->device_info.vulkan_1_2_features.storageBuffer8BitAccess, device->device_info.vulkan_1_2_features.shaderInt8,
                 device->device_info.features2.features.shaderStorageImageMultisample,

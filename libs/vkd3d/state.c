@@ -5560,6 +5560,26 @@ static bool d3d12_pipeline_state_validate_view_instancing(struct d3d12_device *d
     return true;
 }
 
+/* Helios: pick the highest host-backed sample count not exceeding the count the
+ * application asked for. D3D12's no-output sample-count contract is a
+ * driver-declared sample-frequency capability, not host MSAA support, so a
+ * pipeline may request 16x while the host Vulkan mask stops at 8x; only the
+ * Vulkan rasterization sample count is clamped. VK_SAMPLE_COUNT_1_BIT is always
+ * present in the mask, so the search terminates.
+ * See docs/dx12/NO_OUTPUT_SAMPLES.md. */
+static VkSampleCountFlagBits vkd3d_helios_effective_no_output_sample_count(
+        VkSampleCountFlags supported, VkSampleCountFlagBits requested)
+{
+    unsigned int count;
+
+    for (count = 16; count > 1; count >>= 1)
+    {
+        if (count <= requested && (supported & count))
+            return (VkSampleCountFlagBits)count;
+    }
+    return VK_SAMPLE_COUNT_1_BIT;
+}
+
 static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipeline_state *state,
         struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc)
 {
@@ -5575,6 +5595,7 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
     VkShaderStageFlagBits curr_stage, prev_stage;
     struct vkd3d_shader_parameter *shader_param;
     VkSampleCountFlagBits sample_count;
+    VkSampleCountFlagBits rasterization_sample_count;
     const struct vkd3d_format *format;
     unsigned int instance_divisor;
     VkVertexInputRate input_rate;
@@ -5920,11 +5941,35 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
         else
             sample_count = forced;
     }
-    if (!have_attachment && !(device->d3d12_caps.options19.SupportedSampleCountsWithNoOutputs & sample_count))
+    /* Helios: the declared mask is the D3D12 contract; the host may back fewer
+     * counts than the contract requires (RADV caps MSAA at 8x). Keep the
+     * requested count in the shader and clamp only Vulkan's rasterization sample
+     * count, so sample-frequency shading still follows the application's count.
+     * See docs/dx12/NO_OUTPUT_SAMPLES.md. */
+    rasterization_sample_count = sample_count;
+    if (!have_attachment)
     {
-        WARN("Unsupported no-output sample count %u.\n", sample_count);
-        hr = E_INVALIDARG;
-        goto fail;
+        VkSampleCountFlags no_output_supported =
+                device->device_info.properties2.properties.limits.framebufferNoAttachmentsSampleCounts;
+
+        if (!(device->d3d12_caps.options19.SupportedSampleCountsWithNoOutputs & sample_count))
+        {
+            WARN("Unsupported no-output sample count %u.\n", sample_count);
+            hr = E_INVALIDARG;
+            goto fail;
+        }
+        if (!(no_output_supported & sample_count))
+        {
+            rasterization_sample_count =
+                    vkd3d_helios_effective_no_output_sample_count(no_output_supported, sample_count);
+            if (vkd3d_atomic_uint32_increment(&device->helios_no_output_sample_count_clamped,
+                    vkd3d_memory_order_relaxed) == 1)
+            {
+                WARN("No-output sample count %u exceeds host backing %#x; rasterizing at %u. "
+                        "Documented Helios compatibility boundary (docs/dx12/NO_OUTPUT_SAMPLES.md).\n",
+                        sample_count, no_output_supported, rasterization_sample_count);
+            }
+        }
     }
 
     shader_param = &graphics->cached_desc.shader_parameters[graphics->cached_desc.shader_parameters_count++];
@@ -6338,7 +6383,7 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
     graphics->ms_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     graphics->ms_desc.pNext = graphics->sample_locations_info.sampleLocationsEnable ? &graphics->sample_locations_info : NULL;
     graphics->ms_desc.flags = 0;
-    graphics->ms_desc.rasterizationSamples = sample_count;
+    graphics->ms_desc.rasterizationSamples = rasterization_sample_count;
     graphics->ms_desc.sampleShadingEnable = VK_FALSE;
     graphics->ms_desc.minSampleShading = 0.0f;
     graphics->ms_desc.pSampleMask = &graphics->sample_mask;
