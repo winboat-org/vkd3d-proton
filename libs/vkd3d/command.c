@@ -25045,6 +25045,57 @@ static void d3d12_command_queue_wait(struct d3d12_command_queue *command_queue,
     }
 }
 
+/* ⛔ HELIOS: submit one empty batch that signals a FRESH submission-timeline value,
+ * and return it, so a caller can wait on a value that is provably not yet reached.
+ *
+ * WHY. `last_submission_timeline_value` is a CACHE of the most recent signal this
+ * queue submitted. A fence that waits on an already-retired value is satisfied with
+ * no GPU dependency at all, which is how an application's fence can advance in
+ * microseconds while the submitted work is still executing: measured on Helios as a
+ * `WAIT ... us=4` against a normal ~350 us for the same 16 KiB copy, followed by a
+ * readback holding a previous epoch's bytes (`tmp/uv1-20260913`, allocator oracle).
+ * The same operation is what `vkd3d_release_vk_queue` performs for interop callers
+ * ("Need to increment the submission counter here so that fence signals and waits
+ * behave as expected in an interop scenario"), so this is the engine's own idiom for
+ * the same requirement rather than a new mechanism.
+ *
+ * The batch carries no command buffers and no waits: on a single Vulkan queue it
+ * completes after everything already submitted to that queue, which is exactly the
+ * ordering the fence needs. Returns 0 if the submit failed, in which case the
+ * cached value must be used because the freshly consumed value will never arrive. */
+static uint64_t vkd3d_helios_signal_fresh_timeline_value(struct d3d12_command_queue *queue)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
+    VkSemaphoreSubmitInfo semaphore_info;
+    VkSubmitInfo2 submit_info;
+    VkQueue vk_queue;
+    VkResult vr;
+
+    memset(&semaphore_info, 0, sizeof(semaphore_info));
+    semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    semaphore_info.semaphore = queue->vkd3d_queue->submission_timeline;
+    semaphore_info.value = ++queue->vkd3d_queue->submission_timeline_count;
+    semaphore_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    memset(&submit_info, 0, sizeof(submit_info));
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit_info.signalSemaphoreInfoCount = 1;
+    submit_info.pSignalSemaphoreInfos = &semaphore_info;
+
+    if (!(vk_queue = vkd3d_queue_acquire(queue->vkd3d_queue)))
+        return 0;
+
+    vr = VK_CALL(vkQueueSubmit2(vk_queue, 1, &submit_info,
+            vkd3d_queue_get_signal_fence_proxy_locked(queue->vkd3d_queue)));
+    vkd3d_queue_release(queue->vkd3d_queue);
+
+    if (vr != VK_SUCCESS)
+        return 0;
+
+    queue->last_submission_timeline_value = semaphore_info.value;
+    return semaphore_info.value;
+}
+
 static void d3d12_command_queue_signal(struct d3d12_command_queue *command_queue,
         struct d3d12_fence *fence, UINT64 value)
 {
@@ -25068,7 +25119,10 @@ static void d3d12_command_queue_signal(struct d3d12_command_queue *command_queue
 
     memset(&fence_info, 0, sizeof(fence_info));
     fence_info.vk_semaphore = command_queue->vkd3d_queue->submission_timeline;
-    fence_info.vk_semaphore_value = command_queue->last_submission_timeline_value;
+    /* ⛔ Wait on a value submitted HERE, not on the cached one (see the helper). */
+    fence_info.vk_semaphore_value = vkd3d_helios_signal_fresh_timeline_value(command_queue);
+    if (!fence_info.vk_semaphore_value)
+        fence_info.vk_semaphore_value = command_queue->last_submission_timeline_value;
 
     signal_info = vkd3d_waiting_fence_set_callback(&fence_info,
             &vkd3d_waiting_fence_signal_fence, sizeof(*signal_info));
