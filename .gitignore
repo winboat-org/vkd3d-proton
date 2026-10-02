@@ -4,3 +4,10 @@ vkd3d-proton-*.tar.zst
 vkd3d-proton-*/
 /profiles/vulkan
 /profiles/profile-test
+
+# Local standalone devenv state
+/.devenv/
+/.direnv/
+
+/result
+/result-*
