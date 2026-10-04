@@ -9,6 +9,17 @@
 }:
 assert toolchain == { };
 assert schemaVersion == 1 && (target == "engine-x64" || target == "engine-x86");
+let
+  archives = [
+    "libs/d3d12core/libhelios_d3d12_static.a"
+    "libs/vkd3d/libvkd3d-proton.a"
+    "libs/vkd3d-shader/libvkd3d-shader.a"
+    "libs/vkd3d-common/libvkd3d_common.a"
+    "subprojects/dxil-spirv/libdxil-spirv.a"
+    "subprojects/dxil-spirv/libdxbc_spv_module.a"
+    "subprojects/dxil-spirv/subprojects/dxbc-spirv/libdxbc_spv.a"
+  ];
+in
 {
   backend = "devbox";
   purpose = "build";
@@ -29,6 +40,8 @@ assert schemaVersion == 1 && (target == "engine-x64" || target == "engine-x86");
       "@nativeFile@"
       "-Db_vscrt=mt"
       "-Denable_tests=false"
+      "-Dc_args=/Z7 -Wno-error=incompatible-pointer-types"
+      "-Dcpp_args=/Z7 /D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
     ]
     [
       "meson"
@@ -36,7 +49,22 @@ assert schemaVersion == 1 && (target == "engine-x64" || target == "engine-x86");
       "-C"
       "@buildDirectory@"
       "helios_d3d12_static"
+      "vkd3d-proton"
+      "vkd3d-shader"
+      "vkd3d_common"
+      "dxil-spirv"
+      "dxbc_spv_module"
+      "dxbc_spv"
     ]
+    # Meson dependencies select includes/link inputs; they do not merge the
+    # archive members. UMD12 needs the complete measured static engine union.
+    (
+      [
+        "llvm-lib"
+        "/out:@buildDirectory@/helios_d3d12_engine.lib"
+      ]
+      ++ map (path: "@buildDirectory@/${path}") archives
+    )
   ];
   requirements = [
     "LLVM-22.1.8-clang-cl-lld-link"
@@ -45,9 +73,5 @@ assert schemaVersion == 1 && (target == "engine-x64" || target == "engine-x86");
     "dxil-spirv-at-paired-pin"
     "fixed-SPIRV-Tools"
   ];
-  outputs = [
-    "libs/d3d12core/libhelios_d3d12_static.a"
-    "shader-libraries"
-    "pdb"
-  ];
+  outputs = archives ++ [ "helios_d3d12_engine.lib" ];
 }
