@@ -56,15 +56,6 @@ in
       "dxbc_spv_module"
       "dxbc_spv"
     ]
-    # Meson dependencies select includes/link inputs; they do not merge the
-    # archive members. UMD12 needs the complete measured static engine union.
-    (
-      [
-        "llvm-lib"
-        "/out:@buildDirectory@/helios_d3d12_engine.lib"
-      ]
-      ++ map (path: "@buildDirectory@/${path}") archives
-    )
   ];
   requirements = [
     "LLVM-22.1.8-clang-cl-lld-link"
@@ -73,5 +64,8 @@ in
     "dxil-spirv-at-paired-pin"
     "fixed-SPIRV-Tools"
   ];
-  outputs = archives ++ [ "helios_d3d12_engine.lib" ];
+  # Measured native MSVC archive: the core includes every dependency member
+  # plus its three entry/debug members. Keep the individual archives too for
+  # complete shader provenance; a second merge would duplicate the union.
+  outputs = archives;
 }
